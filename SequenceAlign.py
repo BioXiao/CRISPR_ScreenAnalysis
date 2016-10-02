@@ -15,35 +15,37 @@ import argparse
 #############################################
 ### Core Functions
 #############################################
-def alignSeq2count(infileNameList, outFileNameList, countFileNameList, processPool, RefLibrary, startIdx = None, stopIdx = None, test = False):
+def alignSeq2count(infilePathList, unalignedFilePathList, countFilePathList, processPool, RefLibrary, startIdx = None, endIdx = None, test = False):
     '''
     Functions for parallel process multiple sequence files
 
-    :param infileNameList:
-    :param outFileNameList:
-    :param countFileNameList:
+    :param infilePathList: Input sequence files to be aligned
+    :param unalignedFilePathList: Output unaligned sequence read files
+    :param countFilePathList: Output sequence count files
     :param processPool:
-    :param RefLibrary:
-    :param startIdx:
-    :param stopIdx:
-    :param test:
+    :param RefLibrary: Library reference file
+    :param startIdx: Start index of input sequence read to be aligned
+    :param endIdx: End index of input sequence read to be aligned
+    :param test: If just align the first N read for testing
     :return:
     '''
-    if len(infileNameList) != len(outFileNameList):
+
+    if len(infilePathList) != len(unalignedFilePathList):
         raise ValueError('Input and ouput file number do not match!')
 
     # assemble parameters of each file for alignment function
-    argLength = len(outFileNameList)
-    align_argList = zip(infileNameList, outFileNameList, countFileNameList, [RefLibrary]*argLength, [startIdx]*argLength, [stopIdx]*argLength)
+    fileNum = len(infilePathList)
+    align_argList = zip(infilePathList, unalignedFilePathList, countFilePathList, [RefLibrary]*fileNum, [startIdx]*fileNum, [stopIdx]*fileNum, [test]*fileNum)
 
     # multiprocessing
-    = processPool.map(alignArgsWrapper, align_argList)
+    readsPerFile = processPool.map(alignArgsWrapper, align_argList)
 
-    return zip()
+    return zip(countFilePathList, readsPerFile)
 
 
 def alignArgsWrapper(argList):
     '''
+    Function to pass the argument list as seprate argument to the real aligning function
 
     :param argList:
     :return:
@@ -52,11 +54,12 @@ def alignArgsWrapper(argList):
     return seq2count(*argList)
 
 
-def seq2count(infilePath, outUnalignedFilePath, RefLibrary, startIdx = None, stopIdx = None, test = False):
+def seq2count(infilePath, outUnalignedFilePath, countFilePath, RefLibrary, startIdx = None, stopIdx = None, test = False):
     '''
 
     :param infilePath:
     :param outUnalignedFilePath:
+    :param countFilePath:
     :param RefLibrary:
     :param startIdx:
     :param stopIdx:
@@ -85,12 +88,12 @@ def seq2count(infilePath, outUnalignedFilePath, RefLibrary, startIdx = None, sto
     else:
         raise ValueError('Sequence file type not recognized!')
 
-    SeqID_dict, IDCount_dict, expectedReadLength = parseLibraryFasta(args.RefLibrary)
+    SeqID_dict, IDCount_dict, expectedReadLength = parseLibraryFasta(RefLibrary)
 
     curRead = 0
     numAligning = 0
 
-    with open(outUnalignedFilePath) as unaligned_f:
+    with open(outUnalignedFilePath, 'w') as unaligned_f:
         # loop through each line of input fastq file
         for i, fastqLine in enumerate(infile):
             if i % 4 != 1:      # only select the sequence line
@@ -103,7 +106,29 @@ def seq2count(infilePath, outUnalignedFilePath, RefLibrary, startIdx = None, sto
                     raise ValueError('Trimmed read length does not match expected reference read length!')
 
                 if seq in SeqID_dict:
+                    # seq found in reference
                     for eachSeqID in SeqID_dict[seq]:
+                        IDCount_dict[eachSeqID] += 1
+
+                    numAligning += 1
+
+                else:
+                    # seq not found in reference
+                    unaligned_f.write('>%d\n%s\n' % (i, seq))
+
+                curRead += 1
+
+                # if test is true, than only analyze the first N reads just for testing the pipeline
+                if test and curRead >= TestLines:
+                    break
+
+    with open(countFilePath, 'w') as count_f:
+        for eachID_count in sorted(zip(IDCount_dict.keys(), IDCount_dict.values())):
+            count_f.write('%s\t%d\n' % eachID_count)
+
+    immed_print('Done processing %s' % infilePath)
+
+    return curRead, numAligning, numAligning * 100.0 / curRead
 
 
 
@@ -117,20 +142,23 @@ def parseSeqFileName(fileNameList):
     Function to parse and check input file name.
 
     :param fileNameList: List of file names to be parsed (wildcard supported)
-    :return outfileBaseList: Output file name list found
+    :return infilePathList: Matched input file path found
+            outfileBaseList: Prepare output file name list
     '''
 
+    infilePathList = []
     outfileBaseList = []
 
     for eachFileName in fileNameList:       # loop through all input file name
         for eachFileMatched in glob.glob(eachFileName):        # for each file name, loop through each matched files
             for eachFileType in zip(*acceptedFileType)[0]:        # for each file, check if file type accepted
                 if fnmatch.fnmatch(eachFileMatched, eachFileType):
+                    infilePathList.append(eachFileMatched)
                     outfileBaseList.append(os.path.split(eachFileMatched)[-1].split('.')[0])        # select the file name from file path, and select file base name from file name
                     break
 
 
-    return outfileBaseList
+    return infilePathList, outfileBaseList
 
 
 def parseLibraryFasta(libraryFasta):
@@ -240,8 +268,8 @@ if __name__ == '__main__':
     numProcessor = max(args.processor, 1)
 
     # check input sequence files
-    outfileBaseList = parseSeqFileName(args.SeqFileName)
-    if len(outfileBaseList) == 0:
+    infilePathList, outfileBaseList = parseSeqFileName(args.SeqFileName)
+    if len(infilePathList) == 0:
         sys.exit('Input error: sequence files not found.')
     else:
         print '%d sequence read files found to be analyzed.' % len(outfileBaseList)
@@ -269,9 +297,21 @@ if __name__ == '__main__':
     countFilePathList = [os.path.join(countDir, eachCountFile) for eachCountFile in countFileNameList]      # all count files path
 
     # pool for multiprocessing
-    pool = multiprocessing.Pool(min(len(outfileBaseList), numProcessor))
+    pool = multiprocessing.Pool(min(len(infilePathList), numProcessor))
 
     # start to align sequence to reference
     try:
-        alignResult = anlignSeq2count()
+        alignResult = anlignSeq2count(infilePathList, unalignedFilePathList, countFilePathList, pool, args.RefLibrary, args.trim_start, args.trim_end, args.test)
+    except ValueError as err:
+        sys.exit('Error while processing sequencing files: ' + ''.join(err.args))
+
+    # print alignment result
+    print 'Alignment result:\n'
+    for eachCountFile, eachReadsPerFile in alignResult:
+        print eachCountFile + ':\n\t%.2E reads\t%.2E aligned (%.2f%%)' % eachReadsPerFile
+
+    pool.close()
+    pool.join()
+
+    immed_print('Done processing all input sequence files!')
 
